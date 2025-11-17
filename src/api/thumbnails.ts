@@ -4,6 +4,7 @@ import { getVideo, getVideos, updateVideo } from "../db/videos";
 import type { ApiConfig } from "../config";
 import type { BunRequest } from "bun";
 import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
+import path from "path";
 
 type Thumbnail = {
   data: ArrayBuffer;
@@ -31,10 +32,14 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
     throw new BadRequestError(`File is too large. Max size is 10Mb. File size is ${file.size}`);
   }
   const mediaType = file.type;
+  if (mediaType !== "image/jpeg" && mediaType !== "image/png") {
+    throw new BadRequestError("Only jpeg and png images are accepted as thumbnails");
+  }
 
   const imageData = await file.arrayBuffer();
-  const imageDataBase64 = Buffer.from(imageData).toString("base64");
-  const dataURL = `data:${mediaType};base64,${imageDataBase64}`;
+  const assetName = `${videoId}.${mediaType}`;
+  const dataURL = path.join(cfg.assetsRoot, assetName);
+  await Bun.write(dataURL, imageData);
 
   const videoMetaData = getVideo(cfg.db, videoId);
   if (!videoMetaData) {
@@ -44,8 +49,8 @@ export async function handlerUploadThumbnail(cfg: ApiConfig, req: BunRequest) {
     throw new UserForbiddenError("User logged in is not the owner of the requested video")
   }
 
-  //const thumbnailUrl = `http://localhost:${cfg.port}/api/thumbnails/${videoId}`;
-  const thumbnailUrl = dataURL;
+  const thumbnailUrl = `http://localhost:${cfg.port}/assets/${assetName}`;
+
   videoMetaData.thumbnailURL = thumbnailUrl;
   updateVideo(cfg.db, videoMetaData)
   return respondWithJSON(200, videoMetaData);
