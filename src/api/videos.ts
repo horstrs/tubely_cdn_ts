@@ -1,12 +1,11 @@
-import { respondWithJSON } from "./json";
-import { S3Client, type BunRequest } from "bun";
+import { type BunRequest } from "bun";
 import { type ApiConfig } from "../config";
+import { respondWithJSON } from "./json";
 import { BadRequestError, UserForbiddenError } from "./errors";
 import { getBearerToken, validateJWT } from "../auth";
-import { getVideo, updateVideo } from "../db/videos";
+import { getVideo, updateVideo, type Video } from "../db/videos";
 import path from "path";
-import { randomBytes } from "crypto";
-import { unlink } from "fs/promises"
+import { rm } from "fs/promises"
 
 export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   const MAX_UPLOAD_SIZE = 1 << 30;
@@ -42,26 +41,90 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
     throw new BadRequestError("Only mp4 videos are accepted");
   }
 
-  //const videoData = await file.arrayBuffer();
-  const randomStringName = randomBytes(32).toString("base64url");
-  const assetName = `${randomStringName}.mp4`;
-  let dataURL: string | undefined;
-  try{
-    dataURL = path.join(cfg.assetsRoot, assetName);
-    await Bun.write(dataURL, file);
-    const s3File = cfg.s3Client.file(assetName, {
-      bucket: cfg.s3Bucket,
-      region: cfg.s3Region,
-      type: "video/mp4",
-    });
-    await s3File.write(Bun.file(dataURL));
+  let tempFilePath: string | undefined;
 
-    videoData.videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${assetName}`
-    updateVideo(cfg.db, videoData)
-  } finally {
-    if (dataURL) {
-      try { await unlink(dataURL); } catch {}
-    }
+  tempFilePath = path.join("./tmp", `${videoId}.mp4`);
+  await Bun.write(tempFilePath, file);
+  const processedURL = await processVideoForFastStart(tempFilePath)
+
+  const s3Name = `${await getVideoAspectRatio(processedURL)}/${videoId}.mp4`;
+  const s3File = cfg.s3Client.file(s3Name, {
+    bucket: cfg.s3Bucket,
+    region: cfg.s3Region,
+    type: "video/mp4",
+  });
+  const procFile = Bun.file(processedURL);
+  console.log(await procFile.slice(0, 100).text());
+  console.log((await procFile.slice(0, 100).text()).includes("moov"));
+  await s3File.write(Bun.file(processedURL));
+
+  //videoData.videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${s3Name}`
+  videoData.videoURL = s3Name;
+  updateVideo(cfg.db, videoData)
+  if (processedURL) {
+    try { await rm(processedURL); } catch { }
   }
-  return respondWithJSON(200, videoData);
+  
+  const presignedVideo = dbToSignedVideo(cfg, videoData);
+  return respondWithJSON(200, presignedVideo);
+}
+type VideoAspect = {
+  streams: {
+    width: number,
+    height: number,
+  }[]
+}
+
+async function getVideoAspectRatio(filepath: string) {
+  const proc = Bun.spawn(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", filepath]);
+  if (await proc.exited !== 0) {
+    const errorText = await new Response(proc.stderr).text();
+    throw new Error(`Could not get aspect ratio of video in ${filepath}. Error: ${errorText}`);
+  }
+  const result = await new Response(proc.stdout).text();
+  if (!result) {
+    throw new Error("No info found");
+  }
+  try {
+    const information = JSON.parse(result) as VideoAspect;
+    console.log(information.streams[0]);
+    return calculateRatio(information.streams[0].width, information.streams[0].height);
+  } catch (error) {
+    throw new Error("Could not parse video aspect info")
+  }
+}
+
+function calculateRatio(width: number, height: number) {
+  console.log(`height: ${height}`)
+  console.log(`width: ${width}`)
+  if (height > width) {
+    return ((height / width) >= 1.76 && (height / width) <= 1.78) ? "portrait" : "other";
+  }
+  if (height < width) {
+    return ((width / height) >= 1.76 && (width / height) <= 1.78) ? "landscape" : "other";
+  }
+  return "other";
+}
+
+async function processVideoForFastStart(inputFilePath: string) {
+  const outputPath = `${inputFilePath}.processed`;
+
+  const proc = Bun.spawn(["ffmpeg", "-i", inputFilePath, "-movflags", "faststart", "-map_metadata", "0", "-codec", "copy", "-f", "mp4", outputPath])
+
+  if (await proc.exited !== 0) {
+    const errorText = await new Response(proc.stderr).text();
+    throw new Error(`Could not process video for fast start. ${errorText}`);
+  }
+  return outputPath;
+}
+
+function generatePresignerURL(cfg: ApiConfig, key: string, expireTime: number) {
+  return cfg.s3Client.presign(key, { expiresIn: expireTime });
+}
+
+export function dbToSignedVideo(cfg: ApiConfig, video: Video) {
+  if(video.videoURL){
+    video.videoURL = generatePresignerURL(cfg, video.videoURL, 3600);
+  }
+  return video;
 }
