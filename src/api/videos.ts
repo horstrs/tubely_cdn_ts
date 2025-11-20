@@ -58,15 +58,14 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   console.log((await procFile.slice(0, 100).text()).includes("moov"));
   await s3File.write(Bun.file(processedURL));
 
-  //videoData.videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${s3Name}`
-  videoData.videoURL = s3Name;
+  //videoData.videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${s3Name}`;
+  videoData.videoURL = `https://${cfg.s3CfDistribution}/${s3Name}`;
   updateVideo(cfg.db, videoData)
   if (processedURL) {
     try { await rm(processedURL); } catch { }
   }
   
-  const presignedVideo = dbToSignedVideo(cfg, videoData);
-  return respondWithJSON(200, presignedVideo);
+  return respondWithJSON(200, videoData);
 }
 type VideoAspect = {
   streams: {
@@ -116,15 +115,4 @@ async function processVideoForFastStart(inputFilePath: string) {
     throw new Error(`Could not process video for fast start. ${errorText}`);
   }
   return outputPath;
-}
-
-function generatePresignerURL(cfg: ApiConfig, key: string, expireTime: number) {
-  return cfg.s3Client.presign(key, { expiresIn: expireTime });
-}
-
-export function dbToSignedVideo(cfg: ApiConfig, video: Video) {
-  if(video.videoURL){
-    video.videoURL = generatePresignerURL(cfg, video.videoURL, 3600);
-  }
-  return video;
 }
